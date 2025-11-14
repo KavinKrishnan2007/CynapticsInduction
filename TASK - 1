@@ -1,0 +1,125 @@
+import os
+import librosa
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (
+    Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+)
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import warnings
+warnings.filterwarnings("ignore")
+
+base_dir = "/content/the-frequency-quest"
+train_dir = os.path.join(base_dir, "train", "train")
+test_dir = os.path.join(base_dir, "test", "test")
+
+def extract_mel_spectrogram(file_path, n_mels=128, max_len=128, augment=False):
+    try:
+        y, sr = librosa.load(file_path, sr=22050, duration=5)
+        y = librosa.util.normalize(y)
+
+        if augment:
+            if np.random.rand() < 0.5:
+                y = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=np.random.uniform(-2, 2))
+            if np.random.rand() < 0.5:
+                rate = np.random.uniform(0.8, 1.2)
+                y = librosa.effects.time_stretch(y, rate=rate)
+
+        mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+
+        if mel_db.shape[1] < max_len:
+            pad_width = max_len - mel_db.shape[1]
+            mel_db = np.pad(mel_db, pad_width=((0, 0), (0, pad_width)), mode='constant')
+        else:
+            mel_db = mel_db[:, :max_len]
+
+        return mel_db
+
+X, y = [], []
+
+for label in os.listdir(train_dir):
+    label_path = os.path.join(train_dir, label)
+    if not os.path.isdir(label_path):
+        continue
+    print(f"Processing: {label}")
+    for fname in os.listdir(label_path):
+        if fname.endswith(".wav"):
+            fpath = os.path.join(label_path, fname)
+            feat = extract_mel_spectrogram(fpath, augment=True)
+            X.append(feat)
+            y.append(label)
+
+X = np.array(X)[..., np.newaxis]
+y = np.array(y)
+print("Training samples:", X.shape)
+
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+y_cat = to_categorical(y_encoded)
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y_cat, test_size=0.2, stratify=y_cat, random_state=42
+)
+
+print("X_train:", X_train.shape)
+print("y_train:", y_train.shape)
+
+model = Sequential([
+    Conv2D(32, (3,3), activation='relu', input_shape=(128,128,1), kernel_regularizer=l2(0.001)),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Dropout(0.3),
+
+    Conv2D(64, (3,3), activation='relu', kernel_regularizer=l2(0.001)),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Dropout(0.4),
+
+    Conv2D(128, (3,3), activation='relu', kernel_regularizer=l2(0.001)),
+    BatchNormalization(),
+    MaxPooling2D((2,2)),
+    Dropout(0.4),
+
+    Flatten(),
+    Dense(256, activation='relu', kernel_regularizer=l2(0.001)),
+    Dropout(0.5),
+    Dense(len(le.classes_), activation='softmax')
+])
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.0005)
+model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+early_stop = EarlyStopping(patience=8, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-6)
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=50,
+    batch_size=16,
+    callbacks=[early_stop, reduce_lr],
+    verbose=1
+
+test_features, test_files = [], []
+for fname in os.listdir(test_dir):
+    if fname.endswith(".wav"):
+        fpath = os.path.join(test_dir, fname)
+        feat = extract_mel_spectrogram(fpath)
+        test_features.append(feat)
+        test_files.append(fname)
+
+X_test = np.array(test_features)[..., np.newaxis]
+
+preds = model.predict(X_test)
+pred_labels = le.inverse_transform(np.argmax(preds, axis=1))
+
+submission = pd.DataFrame({"ID": test_files, "Class": pred_labels}).sort_values("ID")
+submission.to_csv("/content/submission_cnn_v2.csv", index=False)
